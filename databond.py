@@ -1,5 +1,6 @@
 import argparse
 import sys
+from sqlalchemy import create_engine
 
 #Create and engine and get the metadata
 
@@ -20,16 +21,19 @@ def create_orm_classes():
             f.write('class {}(Base):\n'.format(classname))
             f.write('\t__table__ = Table(\'{}\', source_metadata, autoload=True)\n'.format(table))
 
-def create_db_config(database_file):
+def create_db_config(args):
     with open(dbconfigfile, 'w') as f:
         f.write('from sqlalchemy import * \n')
         f.write('from sqlalchemy.orm import create_session\n')
         f.write('from sqlalchemy.ext.declarative import declarative_base\n')
         f.write('Base = declarative_base()\n')
-        f.write('source_engine = create_engine(\'sqlite:///{}\')\n'.format(database_file))
+        f.write('source_engine = create_engine(\'sqlite:///{}\')\n'.format(args.sqlite_file))
         f.write('source_metadata = MetaData(bind=source_engine)\n')
         f.write('source_metadata.reflect(source_engine)\n')
         f.write('source_session = create_session(bind=source_engine)\n')
+        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}\')\n'.format(args.user, args.password, args.host, args.port))
+        f.write('target_metadata = MetaData(bind=target_engine)\n')
+        f.write('target_session = create_session(bind=target_engine)\n')
 
 def connect_sqlite(database_file):
     Base = declarative_base()
@@ -38,6 +42,15 @@ def connect_sqlite(database_file):
     metadata.reflect(engine)
     session = create_session(bind=engine)
 
+def create_mysql_db(args):
+    """ create a mysql database using the sqlite filename """
+    target_engine = create_engine('mysql+pymysql://{}:{}@{}:{}'.format(args.user, args.password, args.host, args.port))
+    conn = target_engine.connect()
+    if '.' in args.sqlite_file:
+        database_name = args.sqlite_file.split('.')[0]
+
+    result = conn.execute('create database {}'.format(database_name))
+    conn.close()
 
 if __name__ == '__main__':
 
@@ -45,16 +58,19 @@ if __name__ == '__main__':
     parser.add_argument('sqlite_file', action='store')
     parser.add_argument('--host', action='store', default='localhost', help='MySQL Host')
     parser.add_argument('--user', action='store', default='root', help='MySQL User')
-    parser.add_argument('--pass', action='store', required=True, help='MySQL Pass')
+    parser.add_argument('--password', action='store', default='', help='MySQL Password')
+    parser.add_argument('--port', action='store', default='3306', help='MySQL Port')
     args = parser.parse_args()
 
     # try to import a db config, if one doesn't exist yet create it
     try:
-        from db import source_metadata
+        from db import *
     except ImportError:
-        create_db_config(args.sqlite_file)
+        create_db_config(args)
         print('Created database config for {}, run me again.'.format(args.sqlite_file))
         sys.exit(0)
+
+    create_mysql_db(args)
 
     classes = create_orm_classes()
 
