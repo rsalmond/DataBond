@@ -1,6 +1,7 @@
 import argparse
 import sys
 from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative.api import DeclarativeMeta
 
 #Create and engine and get the metadata
 
@@ -21,7 +22,10 @@ def create_orm_classes():
             f.write('class {}(Base):\n'.format(classname))
             f.write('\t__table__ = Table(\'{}\', source_metadata, autoload=True)\n'.format(table))
 
+    return classes
+
 def create_db_config(args):
+    db_name = args.sqlite_file.split('.')[0]
     with open(dbconfigfile, 'w') as f:
         f.write('from sqlalchemy import * \n')
         f.write('from sqlalchemy.orm import create_session\n')
@@ -31,7 +35,7 @@ def create_db_config(args):
         f.write('source_metadata = MetaData(bind=source_engine)\n')
         f.write('source_metadata.reflect(source_engine)\n')
         f.write('source_session = create_session(bind=source_engine)\n')
-        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}\')\n'.format(args.user, args.password, args.host, args.port))
+        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}/{}\')\n'.format(args.user, args.password, args.host, args.port, db_name))
         f.write('target_metadata = MetaData(bind=target_engine)\n')
         f.write('target_session = create_session(bind=target_engine)\n')
 
@@ -47,9 +51,9 @@ def create_mysql_db(args):
     target_engine = create_engine('mysql+pymysql://{}:{}@{}:{}'.format(args.user, args.password, args.host, args.port))
     conn = target_engine.connect()
     if '.' in args.sqlite_file:
-        database_name = args.sqlite_file.split('.')[0]
+        db_name = args.sqlite_file.split('.')[0]
 
-    result = conn.execute('create database {}'.format(database_name))
+    result = conn.execute('create database {}'.format(db_name))
     conn.close()
 
 if __name__ == '__main__':
@@ -70,11 +74,31 @@ if __name__ == '__main__':
         print('Created database config for {}, run me again.'.format(args.sqlite_file))
         sys.exit(0)
 
+
+    print('Creating target database.')
     create_mysql_db(args)
 
     classes = create_orm_classes()
 
     from classes import *
 
-    import pdb
-    pdb.set_trace()
+    # some sqlite thing we dont need
+    source_metadata.remove(source_metadata.tables.get('sqlite_sequence'))
+
+    # create tables in the target db
+    print('Creating tables in target database.')
+    source_metadata.create_all(bind=target_engine)
+
+    for var in dict(locals()):
+        # XXX: I *think* this is safe ...
+        if locals().get(var).__class__ is DeclarativeMeta:
+            baseclass = locals().get(var)
+            print('Importing data for {}.'.format(baseclass))
+
+            import pdb
+            pdb.set_trace()
+
+            for row in source_session.query(baseclass).all():
+                target_session.add(row)
+                db.session.commit()
+
