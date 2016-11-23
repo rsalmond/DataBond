@@ -35,7 +35,7 @@ def create_db_config(args):
         f.write('source_metadata = MetaData(bind=source_engine)\n')
         f.write('source_metadata.reflect(source_engine)\n')
         f.write('source_session = create_session(bind=source_engine)\n')
-        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}/{}\')\n'.format(args.user, args.password, args.host, args.port, db_name))
+        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8\', encoding=\'utf-8\')\n'.format(args.user, args.password, args.host, args.port, db_name))
         f.write('target_metadata = MetaData(bind=target_engine)\n')
         f.write('target_session = create_session(bind=target_engine)\n')
 
@@ -89,16 +89,16 @@ if __name__ == '__main__':
     print('Creating tables in target database.')
     source_metadata.create_all(bind=target_engine)
 
+
     for var in dict(locals()):
         # XXX: I *think* this is safe ...
         if locals().get(var).__class__ is DeclarativeMeta:
             baseclass = locals().get(var)
-            print('Importing data for {}.'.format(baseclass))
-
-            import pdb
-            pdb.set_trace()
-
-            for row in source_session.query(baseclass).all():
-                target_session.add(row)
-                db.session.commit()
+            if hasattr(baseclass, '__mapper__'):
+                print('Importing data for {}.'.format(baseclass))
+                for row in source_session.query(baseclass).all():
+                    print('Inserting row {}'.format(row.id))
+                    #source_session.expunge(row)
+                    target_session.merge(row)
+                    target_session.flush()
 
