@@ -1,67 +1,41 @@
 import argparse
 import sys
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative.api import DeclarativeMeta
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy.orm import Session
+from sqlalchemy.ext.automap import automap_base
 
-classfile = 'classes.py'
-dbconfigfile = 'db.py'
+def create_dest_db(engine, name):
+    """ create a new db in dest db and returns a new connection to that db"""
 
-def create_orm_classes():
-    """ create a python file with sqlalchemy class for each table in the db """
-    with open(classfile, 'w') as f:
-        f.write('from db import Base, source_metadata\n')
-        f.write('from sqlalchemy import Table\n')
-        for table in source_metadata.tables.keys():
-            if table == 'sqlite_sequence':
-                continue
-            classname = table.lower().capitalize()
-            f.write('class {}(Base):\n'.format(classname))
-            f.write('\t__table__ = Table(\'{}\', source_metadata, autoload=True)\n'.format(table))
+    # don't need to bother with sqlite
+    if engine.url.drivername != 'sqlite':
+        print('Creating destination database.')
+        conn = engine.connect()
+        result = conn.execute('create database {}'.format(name))
+        conn.close()
 
-def create_db_config(args):
-    """ create a python file with db config and sqlalchemy init """
-    db_name = args.sqlite_file.split('.')[0]
-    with open(dbconfigfile, 'w') as f:
-        f.write('from sqlalchemy import * \n')
-        f.write('from sqlalchemy.orm import create_session\n')
-        f.write('from sqlalchemy.ext.declarative import declarative_base\n')
-        f.write('classreg = {}\n')
-        f.write('Base = declarative_base(class_registry=classreg)\n')
-        f.write('source_engine = create_engine(\'sqlite:///{}\')\n'.format(args.sqlite_file))
-        f.write('source_metadata = MetaData(bind=source_engine)\n')
-        f.write('source_metadata.reflect(source_engine)\n')
-        f.write('source_session = create_session(bind=source_engine)\n')
-        f.write('target_engine = create_engine(\'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8\', encoding=\'utf-8\')\n'.format(args.user, args.password, args.host, args.port, db_name))
-        f.write('target_metadata = MetaData(bind=target_engine)\n')
-        f.write('target_session = create_session(bind=target_engine)\n')
+        # reconnect to the destination database addressing the newly created database
+        del engine
+        engine = create_engine('{}/{}'.format(args.destdb, dbname), connect_args=connect_args)
 
-def connect_sqlite(database_file):
-    Base = declarative_base()
-    engine = create_engine('sqlite:///{}'.format(database_file))
-    metadata = MetaData(bind=engine)
-    metadata.reflect(engine)
-    session = create_session(bind=engine)
+    return engine
 
-def create_mysql_db(args):
-    """ create a mysql database using the sqlite filename """
-    target_engine = create_engine('mysql+pymysql://{}:{}@{}:{}'.format(args.user, args.password, args.host, args.port))
-    conn = target_engine.connect()
-    if '.' in args.sqlite_file:
-        db_name = args.sqlite_file.split('.')[0]
-
-    result = conn.execute('create database {}'.format(db_name))
-    conn.close()
-
+def get_db_name(engine):
+    if engine.name == 'sqlite':
+        return engine.url.database.rsplit('.')[0]
+    else:
+        return engine.url.database
 
 def sort_mappers(classes):
-    """ try to put mapper objects / tables into an insert order which will allow foreign key constraints to be satisfied """
+    """ try to put mapper objects into an insert order which will allow foreign key constraints to be satisfied """
     order = []
 
     #iterate over a copy of the list
     classlist = dict(classes)
 
-    #not sure what this is, probably dont need it?
-    del classlist['_sa_module_registry']
+    # not sure what it is but it mucks things up
+    if '_sa_module_registry' in classlist:
+        del classlist['_sa_module_registry']
 
     # because tables with foreign key constraints may come up in the list prior to the tables they rely on
     # we may skip some tables one (or more) times and need to re-iterate the list until we have them all
@@ -72,8 +46,7 @@ def sort_mappers(classes):
         for name, cls in classlist.items():
             # tables with no foreign key constraints can be inserted into the new db at any time
             if len(cls.__table__.foreign_key_constraints) == 0:
-                #lower case it for later lookup by table name
-                order.append(name.lower())
+                order.append(name)
                 del classlist[name]
             else:
                 foreign_tables = [fkc.referred_table.name for fkc in cls.__table__.foreign_key_constraints]
@@ -89,45 +62,55 @@ def sort_mappers(classes):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description="SQLite database exporter.")
-    parser.add_argument('sqlite_file', action='store')
-    parser.add_argument('--host', action='store', default='localhost', help='MySQL Host')
-    parser.add_argument('--user', action='store', default='root', help='MySQL User')
-    parser.add_argument('--password', action='store', default='', help='MySQL Password')
-    parser.add_argument('--port', action='store', default='3306', help='MySQL Port')
+    parser = argparse.ArgumentParser(description='SQL database pipe.')
+    parser.add_argument('--sourcedb', action='store', required=True)
+    parser.add_argument('--destdb', action='store', required=True)
+    parser.add_argument('--skip-dest-create', action='store_true', help='Do not automatically create a database in the destination DB.')
+    parser.add_argument('--encoding', action='store', help='Specify a character encoding for dest database, eg. utf8, latin1, etc.')
     args = parser.parse_args()
+    xargs = args
 
-    # try to import a db config, if one doesn't exist yet create it
-    try:
-        from db import *
-    except ImportError:
-        create_db_config(args)
-        print('Created database config for {}, run me again.'.format(args.sqlite_file))
-        sys.exit(0)
+    if args.encoding is not None:
+        connect_args = {'charset': args.encoding}
+    else:
+        connect_args = {}
 
+    # connect to databases and reflect source tables 
+    source_engine = create_engine(args.sourcedb)
+    dest_engine = create_engine(args.destdb, connect_args=connect_args)
+    Base = automap_base()
+    Base.prepare(source_engine, reflect=True)
 
-    print('Creating target database.')
-    create_mysql_db(args)
+    if dest_engine.url.database is not None:
+        if not args.skip_dest_create:
+            print(
+                'You have specified a destination DB connections string which includes a database ' \
+                'name. If you have already created the destination database use --skip-dest-create, ' \
+                'otherwise do not specify a database name in your connection string and it ' \
+                'will be created.')
+            sys.exit(1)
+    else:
+        # determine the db name of the source db and create it in the destination db
+        dbname = get_db_name(source_engine)
+        dest_engine = create_dest_db(dest_engine, dbname)
 
-    create_orm_classes()
+    # get rid of this sqlite specific thing we wont need to export
+    if 'sqlite_sequence' in Base.metadata.tables:
+        Base.metadata.remove(Base.metadata.tables.get('sqlite_sequence'))
 
-    from classes import *
+    source_session = Session(source_engine)
+    dest_session = Session(dest_engine)
 
-    # some sqlite thing we dont need
-    source_metadata.remove(source_metadata.tables.get('sqlite_sequence'))
+    print('Creating tables in dest database.')
+    Base.metadata.create_all(bind=dest_engine)
 
-    # create tables in the target db
-    print('Creating tables in target database.')
-    source_metadata.create_all(bind=target_engine)
-
-    sorted_mappers = sort_mappers(classreg)
+    sorted_mappers = sort_mappers(Base.classes.items())
 
     for mappername in sorted_mappers:
-        mapperobj = classreg[mappername.capitalize()]
+        mapperobj = Base.classes.get(mappername)
         print('Importing data for table {}.'.format(mappername))
         for row in source_session.query(mapperobj).all():
             print('Inserting row {}'.format(row.id))
-            #source_session.expunge(row)
-            target_session.merge(row)
-            target_session.flush()
+            dest_session.merge(row)
+            dest_session.flush()
 
