@@ -1,5 +1,6 @@
-import argparse
 import sys
+import argparse
+import tqdm
 from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.automap import automap_base
@@ -108,9 +109,12 @@ if __name__ == '__main__':
 
     for mappername in sorted_mappers:
         mapperobj = Base.classes.get(mappername)
-        print('Importing data for table {}.'.format(mappername))
-        for row in source_session.query(mapperobj).all():
-            print('Inserting row {}'.format(row.id))
+        print('Importing table {}.'.format(mappername))
+        to_import = source_session.query(mapperobj).all()
+        for row in to_import:
+            print('\rImporting row id {}'.format(row.id)),
             dest_session.merge(row)
             dest_session.flush()
+        if len(to_import) > 0:
+            print('')
 
