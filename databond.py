@@ -6,12 +6,13 @@ from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.automap import automap_base
 
+
 def create_dest_db(engine, name):
     """ create a new db in dest db and returns a new connection to that db"""
 
     # don't need to bother with sqlite
     if engine.url.drivername != 'sqlite':
-        print('Creating destination database.')
+        log.info('Creating destination database.')
         conn = engine.connect()
         result = conn.execute('create database {}'.format(name))
         conn.close()
@@ -63,22 +64,112 @@ def sort_mappers(classes):
     return order
 
 def set_loglevel(args):
-    # note: verbosity == 1 (databond -v) just prints the row ID for every insert)
-    levels = {
-        2: logging.WARNING,
-        3: logging.INFO,
-        4: logging.DEBUG
-    }
-    # when you reach max level you stop leveling
-    if args.verbose > 4:
-        level = 4
-    else:
-        level = args.verbose
 
-    if args.verbose >= 2:
-        logging.basicConfig()
-        logging.getLogger('sqlalchemy.engine').setLevel(levels[level])
+    applevel = logging.INFO
+    sqllevel = logging.WARNING
 
+    if args.verbose is not None:
+        if args.verbose == 1:
+            applevel = logging.DEBUG
+        else:
+            applevel = logging.DEBUG
+            sqllevel = logging.DEBUG
+
+    # set sqlalchemy log level
+    logging.basicConfig()
+    logging.getLogger('sqlalchemy.engine').setLevel(sqllevel)
+
+    # create our own logging object and set its level
+    logger = logging.getLogger(__name__)
+    logger.setLevel(applevel)
+    return logger
+
+def copy(source, dest, base):
+    """ copy rows from source db to dest db """
+
+    sorted_mappers = sort_mappers(base.classes.items())
+
+    for mapper_name in sorted_mappers:
+        mapper_obj = base.classes.get(mapper_name)
+        log.info('Importing table `{}`.'.format(mapper_name))
+        to_import = source.query(mapper_obj).all()
+        imported_count = 0
+        for row in to_import:
+            imported_count += 1
+            log.debug('Importing row id: {}'.format(row.id))
+            dest.merge(row)
+            dest.commit()
+
+def verify(source_session, dest_session, dest_engine, source_base):
+    """ ensure everything in the destination database matches whats in the source database """
+    destbase = automap_base()
+    destbase.prepare(dest_engine, reflect=True)
+
+    def log_diff(source_row, dest_row, column):
+        """ log the differences detected between source and dest rows """
+        table = source_row.__table__.name
+        source_val = getattr(source_row, column)
+        dest_val = getattr(dest_row, column)
+
+        if hasattr(source_row, 'id'):
+            source_id = getattr(source_row, 'id')
+            dest_id = getattr(dest_row, 'id')
+            log.error(u'SOURCE Table: {table} Row ID: {id}, Column: {col}, Value: {value}'.format(table=table, id=source_id, col=column, value=source_val))
+            log.error(u'DEST   Table: {table} Row ID: {id}, Column: {col}, Value: {value}'.format(table=table, id=dest_id, col=column, value=dest_val))
+        else:
+            log.error(u'SOURCE Table: {table} Column: {col}, Value: {value}'.format(table=table, col=column, value=source_val))
+            log.error(u'DEST   Table: {table} Column: {col}, Value: {value}'.format(table=table, col=column, value=dest_val))
+
+
+    # verify dest database has same tables / columns present in source database
+    # XXX: would this be better if it checked that there are no extras in dest db?
+    for table, table_obj in source_base.metadata.tables.items():
+        log.debug('Validating table `{}`.'.format(table))
+        for column, column_obj in table_obj._columns.items():
+            log.debug('Validating column `{}` on table `{}`.'.format(column, table))
+            desttable = destbase.metadata.tables.get(table)
+            if desttable is None:
+                log.error('Verification FAILED: destination table `{}` missing.'.format(table))
+                return
+            else:
+                destcolumn = desttable._columns.get(column)
+                if destcolumn is None:
+                    log.error('Verification FAILD: destination column `{}` is missing from table `{}`.'.format(column, table))
+                    return
+
+    # verify data in source tables matches data in dest tables
+    for source_mapper, source_mapper_obj in source_base.classes.items():
+        if source_mapper_obj.__table__.primary_key is None:
+            log.warn(u'Cannot verify the contents of `{}` as it has no primary key.')
+            continue
+        else:
+            log.info(u'Verifying the contents of table `{}`.'.format(source_mapper))
+
+            source_rows = source_session.query(source_mapper_obj).all()
+            verified_rows = 0
+            for source_row in source_rows:
+                mismatch = False
+                dest_mapper = destbase.classes.get(source_mapper)
+                dest_query = dest_session.query(source_mapper_obj)
+                # iterate over the primary keys for this table
+                # XXX: test this on tables with compound keys
+                for column, column_obj in source_mapper_obj.__table__.primary_key.columns.items():
+                    # create a query against the destination table for each primary key value set on the source row
+                    dest_query = dest_query.filter(getattr(source_mapper_obj, column) == getattr(source_row, column))
+
+                # XXX: pretty sure this should be the case
+                dest_row = dest_query.one()
+
+                for column in source_row.__mapper__.columns.keys():
+                    if getattr(dest_row, column) != getattr(source_row, column):
+                        log.error(u'Verification FAILED: source row / dest row mismatch.')
+                        log_diff(source_row, dest_row, column)
+                        mismatch = True
+
+                if not mismatch:
+                    verified_rows += 1
+
+            log.info(u'{} rows out of {} verified identical in source and destination table {}'.format(verified_rows, len(source_rows), source_mapper))
 
 if __name__ == '__main__':
 
@@ -87,11 +178,13 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--destdb', action='store', required=True)
     parser.add_argument('--skip-dest-create', action='store_true', help='Do not automatically create a database in the destination DB.')
     parser.add_argument('-e', '--encoding', action='store', help='Specify a character encoding for dest database, eg. utf8, latin1, etc.')
-    parser.add_argument('-v', '--verbose', action='count', help='Increase verbosity, use more to increase SQLAlchemy log level (up to four == DEBUG).')
+    parser.add_argument('-v', '--verbose', action='count', help='Increase verbosity, use twice for debug output.')
+    parser.add_argument('-c', '--check-only', action='store_true', help='Do not copy anything, only perform checking that source and dest db are identical.')
     args = parser.parse_args()
-    xargs = args
-    print('Running at log level {}').format(args.verbose)
-    set_loglevel(args)
+
+    global log
+    log = set_loglevel(args)
+    log.info('Operating at log level: {}'.format(log.getEffectiveLevel()))
 
     if args.encoding is not None:
         connect_args = {'charset': args.encoding}
@@ -105,17 +198,24 @@ if __name__ == '__main__':
     Base.prepare(source_engine, reflect=True)
 
     if dest_engine.url.database is not None:
-        if not args.skip_dest_create:
-            print(
+        if not (args.skip_dest_create or args.check_only):
+            log.error(
                 'You have specified a destination DB connections string which includes a database ' \
                 'name. If you have already created the destination database use --skip-dest-create, ' \
                 'otherwise do not specify a database name in your connection string and it ' \
                 'will be created.')
             sys.exit(1)
     else:
-        # determine the db name of the source db and create it in the destination db
-        dbname = get_db_name(source_engine)
-        dest_engine = create_dest_db(dest_engine, dbname)
+        if not args.check_only:
+            # determine the db name of the source db and create it in the destination db
+            dbname = get_db_name(source_engine)
+            dest_engine = create_dest_db(dest_engine, dbname)
+        else:
+            log.error(
+                'You have specified --check-only option but the --destdb connection string does not ' \
+                'include a database name. Please specify a destination database name and try again.'
+            )
+            sys.exit(1)
 
     # get rid of this sqlite specific thing we wont need to export
     if 'sqlite_sequence' in Base.metadata.tables:
@@ -124,24 +224,10 @@ if __name__ == '__main__':
     source_session = Session(source_engine)
     dest_session = Session(dest_engine)
 
-    print('Creating tables in dest database.')
-    Base.metadata.create_all(bind=dest_engine)
+    # copy ze data!
+    if not args.check_only:
+        log.info('Creating tables in dest database.')
+        Base.metadata.create_all(bind=dest_engine)
+        copy(source_session, dest_session, Base)
 
-    sorted_mappers = sort_mappers(Base.classes.items())
-
-
-    for mappername in sorted_mappers:
-        mapperobj = Base.classes.get(mappername)
-        print('Importing table {}.'.format(mappername))
-        to_import = source_session.query(mapperobj).all()
-        for row in to_import:
-            # print a new line for verbose mode
-            if args.verbose >= 1:
-                print('\rImporting row id {}'.format(row.id))
-            else:
-                print('\rImporting row id {}'.format(row.id)),
-            dest_session.merge(row)
-            dest_session.commit()
-        if len(to_import) > 0:
-            print('')
-
+    verify(source_session, dest_session, dest_engine, Base)
