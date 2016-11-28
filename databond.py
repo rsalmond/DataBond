@@ -1,6 +1,7 @@
 import sys
 import argparse
 import tqdm
+import logging
 from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.automap import automap_base
@@ -61,15 +62,36 @@ def sort_mappers(classes):
 
     return order
 
+def set_loglevel(args):
+    # note: verbosity == 1 (databond -v) just prints the row ID for every insert)
+    levels = {
+        2: logging.WARNING,
+        3: logging.INFO,
+        4: logging.DEBUG
+    }
+    # when you reach max level you stop leveling
+    if args.verbose > 4:
+        level = 4
+    else:
+        level = args.verbose
+
+    if args.verbose >= 2:
+        logging.basicConfig()
+        logging.getLogger('sqlalchemy.engine').setLevel(levels[level])
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='SQL database pipe.')
-    parser.add_argument('--sourcedb', action='store', required=True)
-    parser.add_argument('--destdb', action='store', required=True)
+    parser.add_argument('-s', '--sourcedb', action='store', required=True)
+    parser.add_argument('-d', '--destdb', action='store', required=True)
     parser.add_argument('--skip-dest-create', action='store_true', help='Do not automatically create a database in the destination DB.')
-    parser.add_argument('--encoding', action='store', help='Specify a character encoding for dest database, eg. utf8, latin1, etc.')
+    parser.add_argument('-e', '--encoding', action='store', help='Specify a character encoding for dest database, eg. utf8, latin1, etc.')
+    parser.add_argument('-v', '--verbose', action='count', help='Increase verbosity, use more to increase SQLAlchemy log level (up to four == DEBUG).')
     args = parser.parse_args()
     xargs = args
+    print('Running at log level {}').format(args.verbose)
+    set_loglevel(args)
 
     if args.encoding is not None:
         connect_args = {'charset': args.encoding}
@@ -107,14 +129,19 @@ if __name__ == '__main__':
 
     sorted_mappers = sort_mappers(Base.classes.items())
 
+
     for mappername in sorted_mappers:
         mapperobj = Base.classes.get(mappername)
         print('Importing table {}.'.format(mappername))
         to_import = source_session.query(mapperobj).all()
         for row in to_import:
-            print('\rImporting row id {}'.format(row.id)),
+            # print a new line for verbose mode
+            if args.verbose >= 1:
+                print('\rImporting row id {}'.format(row.id))
+            else:
+                print('\rImporting row id {}'.format(row.id)),
             dest_session.merge(row)
-            dest_session.flush()
+            dest_session.commit()
         if len(to_import) > 0:
             print('')
 
