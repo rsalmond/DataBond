@@ -6,13 +6,16 @@ from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.automap import automap_base
 
+VERIFICATION_SUCCESS = 1
+VERIFICATION_FATAL = 2
+VERIFICATION_DIFF = 3
 
 def create_dest_db(engine, name):
     """ create a new db in dest db and returns a new connection to that db"""
 
     # don't need to bother with sqlite
     if engine.url.drivername != 'sqlite':
-        log.info('Creating destination database.')
+        log.info(u'Creating destination database.')
         conn = engine.connect()
         result = conn.execute('create database {}'.format(name))
         conn.close()
@@ -91,12 +94,12 @@ def copy(source, dest, base):
 
     for mapper_name in sorted_mappers:
         mapper_obj = base.classes.get(mapper_name)
-        log.info('Importing table `{}`.'.format(mapper_name))
+        log.info(u'Importing table `{}`.'.format(mapper_name))
         to_import = source.query(mapper_obj).all()
         imported_count = 0
         for row in to_import:
             imported_count += 1
-            log.debug('Importing row id: {}'.format(row.id))
+            log.debug(u'Importing row id: {}'.format(row.id))
             dest.merge(row)
             dest.commit()
 
@@ -104,6 +107,8 @@ def verify(source_session, dest_session, dest_engine, source_base):
     """ ensure everything in the destination database matches whats in the source database """
     destbase = automap_base()
     destbase.prepare(dest_engine, reflect=True)
+
+    retval = VERIFICATION_SUCCESS
 
     def log_diff(source_row, dest_row, column):
         """ log the differences detected between source and dest rows """
@@ -121,23 +126,24 @@ def verify(source_session, dest_session, dest_engine, source_base):
             log.error(u'DEST   Table: {table} Column: {col}, Value: {value}'.format(table=table, col=column, value=dest_val))
 
 
-    # verify dest database has same tables / columns present in source database
-    # XXX: would this be better if it checked that there are no extras in dest db?
+    # verify dest database has same tables / columns present in source database, this test returns immediately on failure
+    # because a missing table / column means we seriously screwed up.
     for table, table_obj in source_base.metadata.tables.items():
-        log.debug('Validating table `{}`.'.format(table))
+        log.debug(u'Validating table `{}`.'.format(table))
         for column, column_obj in table_obj._columns.items():
-            log.debug('Validating column `{}` on table `{}`.'.format(column, table))
+            log.debug(u'Validating column `{}` on table `{}`.'.format(column, table))
             desttable = destbase.metadata.tables.get(table)
             if desttable is None:
-                log.error('Verification FAILED: destination table `{}` missing.'.format(table))
-                return
+                log.error(u'Verification FAILED: destination table `{}` missing.'.format(table))
+                return VERIFICATION_FATAL
             else:
                 destcolumn = desttable._columns.get(column)
                 if destcolumn is None:
-                    log.error('Verification FAILD: destination column `{}` is missing from table `{}`.'.format(column, table))
-                    return
+                    log.error(u'Verification FAILD: destination column `{}` is missing from table `{}`.'.format(column, table))
+                    return VERIFICATION_FATAL
 
-    # verify data in source tables matches data in dest tables
+    # verify data in source tables matches data in dest tables, this test logs differences and continues because data 
+    # differences may have to do with db specifics (eg. unicode handling).
     for source_mapper, source_mapper_obj in source_base.classes.items():
         if source_mapper_obj.__table__.primary_key is None:
             log.warn(u'Cannot verify the contents of `{}` as it has no primary key.')
@@ -168,8 +174,12 @@ def verify(source_session, dest_session, dest_engine, source_base):
 
                 if not mismatch:
                     verified_rows += 1
+                else:
+                    retval = VERIFICATION_DIFF
 
             log.info(u'{} rows out of {} verified identical in source and destination table {}'.format(verified_rows, len(source_rows), source_mapper))
+
+    return retval
 
 if __name__ == '__main__':
 
@@ -184,7 +194,7 @@ if __name__ == '__main__':
 
     global log
     log = set_loglevel(args)
-    log.info('Operating at log level: {}'.format(log.getEffectiveLevel()))
+    log.info(u'Operating at log level: {}'.format(log.getEffectiveLevel()))
 
     if args.encoding is not None:
         connect_args = {'charset': args.encoding}
@@ -200,7 +210,7 @@ if __name__ == '__main__':
     if dest_engine.url.database is not None:
         if not (args.skip_dest_create or args.check_only):
             log.error(
-                'You have specified a destination DB connections string which includes a database ' \
+                u'You have specified a destination DB connections string which includes a database ' \
                 'name. If you have already created the destination database use --skip-dest-create, ' \
                 'otherwise do not specify a database name in your connection string and it ' \
                 'will be created.')
@@ -212,7 +222,7 @@ if __name__ == '__main__':
             dest_engine = create_dest_db(dest_engine, dbname)
         else:
             log.error(
-                'You have specified --check-only option but the --destdb connection string does not ' \
+                u'You have specified --check-only option but the --destdb connection string does not ' \
                 'include a database name. Please specify a destination database name and try again.'
             )
             sys.exit(1)
@@ -226,8 +236,23 @@ if __name__ == '__main__':
 
     # copy ze data!
     if not args.check_only:
-        log.info('Creating tables in dest database.')
+        log.info(u'Creating tables in dest database.')
         Base.metadata.create_all(bind=dest_engine)
         copy(source_session, dest_session, Base)
 
-    verify(source_session, dest_session, dest_engine, Base)
+    verification = verify(source_session, dest_session, dest_engine, Base)
+    
+    completion_messages = {
+        VERIFICATION_SUCCESS: u'Verification successful, every table, column, and row present in the ' \
+                'source db has been verified present in the destination db.',
+        VERIFICATION_FATAL: u'Verification fatal, a table or column was not created in the destination ' \
+                'db, probably a SQL error has been produced as well. If the error cannot be corrected ' \
+                'please file a bug at https://github.com/rsalmond/databond and include this log.',
+        VERIFICATION_DIFF: u'Verification found differences between the data in the source and ' \
+                'destination databases. Differences are documented in the log above, where present ' \
+                'an ID column is also logged. These differences may be expected eg. due to data type ' \
+                'differences between source and destination dbs or encoding differences. Please ' \
+                'closely examine these differences as adjustments may be necessary.'
+    }
+
+    log.info(completion_messages[verification])
