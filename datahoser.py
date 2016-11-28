@@ -228,7 +228,7 @@ def verify(source_session, dest_session, dest_engine, source_base):
                 else:
                     retval = VERIFICATION_DIFF
 
-            log.info(u'{} rows out of {} verified identical in source and destination table {}'.format(verified_rows, len(source_rows), source_mapper))
+            log.info(u'{} rows out of {} verified identical in source and destination table {}.'.format(verified_rows, len(source_rows), source_mapper))
 
     return retval
 
