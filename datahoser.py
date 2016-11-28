@@ -1,6 +1,5 @@
 import sys
 import argparse
-import tqdm
 import logging
 from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
@@ -9,62 +8,6 @@ from sqlalchemy.ext.automap import automap_base
 VERIFICATION_SUCCESS = 1
 VERIFICATION_FATAL = 2
 VERIFICATION_DIFF = 3
-
-def create_dest_db(engine, name):
-    """ create a new db in dest db and returns a new connection to that db"""
-
-    # don't need to bother with sqlite
-    if engine.url.drivername != 'sqlite':
-        log.info(u'Creating destination database.')
-        conn = engine.connect()
-        result = conn.execute('create database {}'.format(name))
-        conn.close()
-
-        # reconnect to the destination database addressing the newly created database
-        del engine
-        engine = create_engine('{}/{}'.format(args.destdb, dbname), connect_args=connect_args)
-
-    return engine
-
-def get_db_name(engine):
-    if engine.name == 'sqlite':
-        return engine.url.database.rsplit('.')[0]
-    else:
-        return engine.url.database
-
-def sort_mappers(classes):
-    """ try to put mapper objects into an insert order which will allow foreign key constraints to be satisfied """
-    order = []
-
-    #iterate over a copy of the list
-    classlist = dict(classes)
-
-    # not sure what it is but it mucks things up
-    if '_sa_module_registry' in classlist:
-        del classlist['_sa_module_registry']
-
-    # because tables with foreign key constraints may come up in the list prior to the tables they rely on
-    # we may skip some tables one (or more) times and need to re-iterate the list until we have them all
-    #
-    #XXX: circular dependencies could put this into an endless loop?!
-    #
-    while True:
-        for name, cls in classlist.items():
-            # tables with no foreign key constraints can be inserted into the new db at any time
-            if len(cls.__table__.foreign_key_constraints) == 0:
-                order.append(name)
-                del classlist[name]
-            else:
-                foreign_tables = [fkc.referred_table.name for fkc in cls.__table__.foreign_key_constraints]
-                # if all tables with foreign keys are ahead of this one its safe to add it to the queue
-                if set(foreign_tables).issubset(set(order)):
-                    order.append(name.lower())
-                    del classlist[name]
-
-        if len(classlist.items()) == 0:
-            break
-
-    return order
 
 def set_loglevel(args):
 
@@ -87,21 +30,133 @@ def set_loglevel(args):
     logger.setLevel(applevel)
     return logger
 
+def make_primary_key_logline(keys, line):
+    """
+    because a table can have multiple primary keys we cant rely on being able to log just one
+    this method will contstruct a logline which includes all keys in case of composite primary
+    """
+
+    keystring = ''
+    for key in keys:
+        formatstring = '%s: {%s}, '
+        formatstring = formatstring % (key, key)
+        keystring += formatstring
+
+    return line % (keystring)
+
+def get_primary_key_params(obj):
+    """
+    generate a dict from a mapped object suitable for formatting a primary key logline
+    """
+    params = {}
+    for key in obj.__table__.primary_key.columns.keys():
+        params[key] = getattr(obj, key)
+
+    return params
+
+def log_row_with_primary_key(line, row, loglevel, params=None):
+    """ 
+    log a line pertinent to a single row / mapped object and populate the log line with 
+    the names and values of the primary keys for that row 
+    """
+
+    key_params = get_primary_key_params(row)
+    logline = make_primary_key_logline(key_params.keys(), line)
+
+    if params is not None:
+        for param in params:
+            key_params[param] = params[param]
+
+    log.log(loglevel, logline.format(**key_params))
+
+def create_dest_db(engine, name):
+    """ create a new db in dest db and returns a new connection to that db"""
+
+    # don't need to bother with sqlite
+    if engine.url.drivername != 'sqlite':
+        log.info(u'Creating destination database.')
+        conn = engine.connect()
+        result = conn.execute('create database {}'.format(name))
+        conn.close()
+
+        # reconnect to the destination database addressing the newly created database
+        del engine
+        engine = create_engine('{}/{}'.format(args.destdb, dbname), connect_args=connect_args)
+
+    return engine
+
+def get_db_name(engine):
+    if engine.name == 'sqlite':
+        if '.' in engine.url.database:
+            return engine.url.database.rsplit('.')[0]
+        else:
+            return engine.url.database
+    else:
+        return engine.url.database
+
+def sort_mappers(classes):
+    """ 
+    try to put mapper objects into an insert order which will allow foreign key constraints to be satisfied 
+    """
+    order = []
+
+    #iterate over a copy of the list so we dont modify the original
+    classlist = dict(classes)
+
+    # not sure what it is but it mucks things up
+    if '_sa_module_registry' in classlist:
+        del classlist['_sa_module_registry']
+
+    # because tables with foreign key constraints may come up in the list prior to the tables they rely on
+    # we may skip some tables one (or more) times and need to re-iterate the list until we have them all
+    #
+    #XXX: circular dependencies could put this into an endless loop?!
+    #
+    while True:
+        for name, cls in classlist.items():
+            # tables with no foreign key constraints can be inserted into the new db at any time
+            if len(cls.__table__.foreign_key_constraints) == 0:
+                if name not in order:
+                    order.append(name)
+                if name in classlist:
+                    del classlist[name]
+            else:
+                foreign_tables = [fkc.referred_table.name for fkc in cls.__table__.foreign_key_constraints]
+                # if the table has a foreign key pointing to itself, we can ignore it
+                if name in foreign_tables:
+                    foreign_tables.remove(name)
+
+                # if all tables with foreign keys are ahead of this one its safe to add it to the queue
+                if set(foreign_tables).issubset(set(order)):
+                    if name not in order:
+                        order.append(name)
+                    if name in classlist:
+                        del classlist[name]
+
+        if len(classlist.items()) == 0:
+            break
+
+    return order
+
 def copy(source, dest, base):
     """ copy rows from source db to dest db """
 
     sorted_mappers = sort_mappers(base.classes.items())
+
 
     for mapper_name in sorted_mappers:
         mapper_obj = base.classes.get(mapper_name)
         log.info(u'Importing table `{}`.'.format(mapper_name))
         to_import = source.query(mapper_obj).all()
         imported_count = 0
+
         for row in to_import:
             imported_count += 1
-            log.debug(u'Importing row id: {}'.format(row.id))
+            log_row_with_primary_key(u'Import row %s', row, logging.DEBUG)
             dest.merge(row)
-            dest.commit()
+            dest.flush()
+
+        dest.commit()
 
 def verify(source_session, dest_session, dest_engine, source_base):
     """ ensure everything in the destination database matches whats in the source database """
@@ -116,14 +171,10 @@ def verify(source_session, dest_session, dest_engine, source_base):
         source_val = getattr(source_row, column)
         dest_val = getattr(dest_row, column)
 
-        if hasattr(source_row, 'id'):
-            source_id = getattr(source_row, 'id')
-            dest_id = getattr(dest_row, 'id')
-            log.error(u'SOURCE Table: {table} Row ID: {id}, Column: {col}, Value: {value}'.format(table=table, id=source_id, col=column, value=source_val))
-            log.error(u'DEST   Table: {table} Row ID: {id}, Column: {col}, Value: {value}'.format(table=table, id=dest_id, col=column, value=dest_val))
-        else:
-            log.error(u'SOURCE Table: {table} Column: {col}, Value: {value}'.format(table=table, col=column, value=source_val))
-            log.error(u'DEST   Table: {table} Column: {col}, Value: {value}'.format(table=table, col=column, value=dest_val))
+        source_params = {'table': table, 'col': column, 'value': source_val}
+        dest_params = {'table': table, 'col': column, 'value': dest_val}
+        log_row_with_primary_key(u'SOURCE Table: {table} %s Column: {col}, Value: {value}', source_row, logging.ERROR, params=source_params)
+        log_row_with_primary_key(u'DEST   Table: {table} %s Column: {col}, Value: {value}', dest_row, logging.ERROR, params=dest_params)
 
 
     # verify dest database has same tables / columns present in source database, this test returns immediately on failure
@@ -207,6 +258,10 @@ if __name__ == '__main__':
     Base = automap_base()
     Base.prepare(source_engine, reflect=True)
 
+    if len(Base.metadata.tables) == 0:
+        log.info(u'No tables found in source database, exiting.')
+        sys.exit(0)
+
     if dest_engine.url.database is not None:
         if not (args.skip_dest_create or args.check_only):
             log.error(
@@ -236,7 +291,7 @@ if __name__ == '__main__':
 
     # copy ze data!
     if not args.check_only:
-        log.info(u'Creating tables in dest database.')
+        log.info(u'Creating {} tables in dest database.'.format(len(Base.metadata.tables.keys())))
         Base.metadata.create_all(bind=dest_engine)
         copy(source_session, dest_session, Base)
 
@@ -244,7 +299,7 @@ if __name__ == '__main__':
     
     completion_messages = {
         VERIFICATION_SUCCESS: u'Verification successful, every table, column, and row present in the ' \
-                'source db has been verified present in the destination db.',
+                'source db is present in the destination db.',
         VERIFICATION_FATAL: u'Verification fatal, a table or column was not created in the destination ' \
                 'db, probably a SQL error has been produced as well. If the error cannot be corrected ' \
                 'please file a bug at https://github.com/rsalmond/databond and include this log.',
