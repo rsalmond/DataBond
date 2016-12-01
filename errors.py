@@ -1,0 +1,2 @@
+class InvalidDB(Exception):
+    pass
