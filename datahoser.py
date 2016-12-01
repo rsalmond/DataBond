@@ -5,6 +5,10 @@ from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.automap import automap_base
 
+from checks import check_create
+from dbmapping import *
+from errors import InvalidDB
+
 VERIFICATION_SUCCESS = 1
 VERIFICATION_FATAL = 2
 VERIFICATION_DIFF = 3
@@ -22,7 +26,7 @@ def set_loglevel(args):
             sqllevel = logging.DEBUG
 
     # set sqlalchemy log level
-    logging.basicConfig()
+    logging.basicConfig(stream=sys.stdout)
     logging.getLogger('sqlalchemy.engine').setLevel(sqllevel)
 
     # create our own logging object and set its level
@@ -257,6 +261,13 @@ if __name__ == '__main__':
     dest_engine = create_engine(args.destdb, connect_args=connect_args)
     Base = automap_base()
     Base.prepare(source_engine, reflect=True)
+
+    try:
+        check_create(Base)
+    except InvalidDB as e:
+        log.error(e.message)
+        log.error(u'Aborting due to fatal error.')
+        sys.exit(1)
 
     if len(Base.metadata.tables) == 0:
         log.info(u'No tables found in source database, exiting.')
