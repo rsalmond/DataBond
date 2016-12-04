@@ -16,6 +16,11 @@ When I found myself needing to convert a sqlite database from a small project in
 
 By building on [the shoulders of giants](http://www.sqlalchemy.org/). SQLAlchemy has, at the time of this writing, [support for six RDBS engines](http://docs.sqlalchemy.org/en/latest/dialects/) which means that Datahoser does too. Datahoser builds on the powerful [reflection](http://docs.sqlalchemy.org/en/latest/core/reflection.html) methods to interrogate an existing database and build representations of it which are then used to replicate it's structure and contents in the destination database. This same approach is then used to verify the copied data.
 
+
+**How well does it work?**
+
+Pretty well for simple database structures, needs a bit of love for more involved data types. For instance, MySQL has a [TINYINT](http://dev.mysql.com/doc/refman/5.7/en/integer-types.html) data type but sqlite does not so these fields must be converted to a data type sqlite provides. Take a look at [dbmapping.py](./dbmapping.py) to see how that is done if you encounter this scenario and need to write a custom mapping.
+
 **How does verification work?**
 
 Each execution runs a verification phase after creating new tables in the destination database and copying everything over. This verification checks first that every table and column present in the source database has actually been created in the destination database. If this check fails the process halts immediately and indicates what table or column is missing. If you encounter this situation try running with `-vv` to examine the SQL commands being sent to the database.
